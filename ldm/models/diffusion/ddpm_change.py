@@ -729,7 +729,7 @@ class LatentDiffusion(DDPM):
                     else:
                         selected = -1 * criterion(op_im, operated_image)
 
-
+                    
                     print(ts)
                     print(selected)
 

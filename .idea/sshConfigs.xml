@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig authType="PASSWORD" host="cmlsub00.umiacs.umd.edu" id="c12ab1ba-0303-4b01-aed6-2177bd2b0b8f" port="22" nameFormat="DESCRIPTIVE" username="bansal01" useOpenSSHConfig="true" />
+    </configs>
+  </component>
+</project>
