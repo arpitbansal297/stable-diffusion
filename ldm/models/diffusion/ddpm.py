@@ -757,7 +757,9 @@ class LatentDiffusion(DDPM):
                 else:
                     model_output = self.apply_model(z, ts, cond)
                     z_recon = self.predict_start_from_noise(z, t=ts, noise=model_output)
-                    recons_image = self.decode_first_stage(z_recon)
+                    recons_image = self.decode_first_stage_with_grad(z_recon)
+
+                    torch.set_grad_enabled(False)
 
                     if operation.print:
                         if i % operation.print_every == 0 and j == 0:
@@ -821,7 +823,17 @@ class LatentDiffusion(DDPM):
                     torch.set_grad_enabled(False)
 
                     recons_image = torch.clamp(recons_image, -1, 1)
-                    z_recon = self.encode_first_stage(recons_image)
+
+                    encoder_posterior = self.encode_first_stage(recons_image)
+                    z_recon = self.get_first_stage_encoding(encoder_posterior).detach()
+                    print("G2 loss ", loss)
+
+                    recons_image = self.decode_first_stage(z_recon)
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/guidance_2_{i}.png')
+
 
 
                 z_epsilon = self.predict_noise_from_xstart(z, ts, z_recon)
