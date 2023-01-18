@@ -29,3 +29,4 @@ class OptimizerDetails:
         self.do_guidance_3_norm = False
         self.sampling_type = None
         self.loss_save = None
+        self.ddpm = False

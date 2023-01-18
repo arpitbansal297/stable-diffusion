@@ -40,6 +40,8 @@ import clip
 import os
 import inspect
 import torchvision.transforms.functional as TF
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from torchvision.datasets import ImageFolder
 
 
 
@@ -161,66 +163,122 @@ def create_folder(path):
             raise
         pass
 
-class Clip(nn.Module):
-    def __init__(self, model):
-        super(Clip, self).__init__()
-        self.model = model
-        self.trans = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-    def forward(self, x, y):
+class FaceRecognition(nn.Module):
+    def __init__(self, fr_crop=False, mtcnn_face=False):
+        super().__init__()
+        self.resnet = InceptionResnetV1(pretrained='vggface2').eval()
+        print(self.resnet)
+        self.mtcnn = MTCNN(device='cuda')
+        self.crop = fr_crop
+        self.output_size = 160
+        self.mtcnn_face = mtcnn_face
 
-        x = (x + 1) * 0.5
-        x = TF.resize(x, (224, 224), interpolation=TF.InterpolationMode.BICUBIC)
-        x = self.trans(x)
+    def extract_face(self, imgs, batch_boxes, mtcnn_face=False):
+        image_size = imgs.shape[-1]
+        faces = []
+        for i in range(imgs.shape[0]):
+            img = imgs[i]
+            if not mtcnn_face:
+                box = [48, 48, 208, 208]
+                crop_face = img[None, :, box[1]:box[3], box[0]:box[2]]
+            elif batch_boxes[i] is not None:
+                print("Face Found")
+                box = batch_boxes[i][0]
+                margin = [
+                    self.mtcnn.margin * (box[2] - box[0]) / (self.output_size - self.mtcnn.margin),
+                    self.mtcnn.margin * (box[3] - box[1]) / (self.output_size - self.mtcnn.margin),
+                ]
 
-        logits_per_image, logits_per_text = self.model(x, y)
-        return -1 * logits_per_image
+                box = [
+                    int(max(box[0] - margin[0] / 2, 0)),
+                    int(max(box[1] - margin[1] / 2, 0)),
+                    int(min(box[2] + margin[0] / 2, image_size)),
+                    int(min(box[3] + margin[1] / 2, image_size)),
+                ]
+                crop_face = img[None, :, box[1]:box[3], box[0]:box[2]]
+            else:
+                print("Face Not Found")
+                crop_face = img[None, :, :, :]
+            faces.append(F.interpolate(crop_face, size=self.output_size, mode='bicubic'))
+        new_faces = torch.cat(faces)
 
+        return (new_faces - 127.5) / 128.0
+
+    def get_faces(self, x, mtcnn_face=False):
+        img = (x + 1.0) * 0.5 * 255.0
+        img = img.permute(0, 2, 3, 1)
+        with torch.no_grad():
+            batch_boxes, batch_probs, batch_points = self.mtcnn.detect(img, landmarks=True)
+            # Select faces
+            batch_boxes, batch_probs, batch_points = self.mtcnn.select_boxes(
+                batch_boxes, batch_probs, batch_points, img, method=self.mtcnn.selection_method
+            )
+
+        img = img.permute(0, 3, 1, 2)
+        faces = self.extract_face(img, batch_boxes, mtcnn_face)
+        return faces
+
+    def forward(self, x, return_faces=False, mtcnn_face=None):
+        x = TF.resize(x, (256, 256), interpolation=TF.InterpolationMode.BICUBIC)
+
+        if mtcnn_face is None:
+            mtcnn_face = self.mtcnn_face
+
+        faces = self.get_faces(x, mtcnn_face=mtcnn_face)
+        if not self.crop:
+            out = self.resnet(x)
+        else:
+            out = self.resnet(faces)
+
+        if return_faces:
+            return out, faces
+        else:
+            return out
+
+    def cuda(self):
+        self.resnet = self.resnet.cuda()
+        self.mtcnn = self.mtcnn.cuda()
+        return self
+
+def cycle_cat(dl):
+    while True:
+        for data in dl:
+            yield data[0]
+
+def l1_loss(input, target):
+    l = torch.abs(input - target).mean(dim=[1])
+    return l
 
 def get_optimation_details(args):
-    clip_model, clip_preprocess = clip.load("RN50")
-    print(clip_preprocess)
-    clip_model.eval()
-    for param in clip_model.parameters():
-        param.requires_grad = False
+    mtcnn_face = not args.center_face
+    print('mtcnn_face')
+    print(mtcnn_face)
 
-    l_func = Clip(clip_model)
-    l_func.eval()
-    for param in l_func.parameters():
-        param.requires_grad = False
-    l_func = torch.nn.DataParallel(l_func).cuda()
-
-
+    guidance_func = FaceRecognition(fr_crop=args.fr_crop, mtcnn_face=mtcnn_face).cuda()
     operation = OptimizerDetails()
 
     operation.num_steps = args.optim_num_steps
-    operation.operation_func = None
-    operation.other_guidance_func = None
+    operation.operation_func = guidance_func
 
     operation.optimizer = 'Adam'
     operation.lr = args.optim_lr
-    operation.loss_func = l_func
-    operation.other_criterion = None
+    operation.loss_func = l1_loss
 
     operation.max_iters = args.optim_max_iters
     operation.loss_cutoff = args.optim_loss_cutoff
-    operation.tv_loss = args.optim_tv_loss
 
     operation.guidance_3 = args.optim_guidance_3
     operation.guidance_2 = args.optim_guidance_2
 
-    operation.original_guidance = args.optim_original_guidance
-    operation.mask_type = args.optim_mask_type
-
     operation.optim_guidance_3_wt = args.optim_guidance_3_wt
-    operation.do_guidance_3_norm = args.optim_do_guidance_3_norm
 
     operation.warm_start = args.optim_warm_start
     operation.print = args.optim_print
-    operation.print_every = 500
+    operation.print_every = 5
     operation.folder = args.optim_folder
 
-    return operation, l_func
+    return operation
 
 def main():
     parser = argparse.ArgumentParser()
@@ -375,6 +433,9 @@ def main():
     parser.add_argument('--text_type', type=int, default=1)
     parser.add_argument("--batches", default=0, type=int)
 
+    parser.add_argument('--fr_crop', action='store_true')
+    parser.add_argument('--center_face', action='store_true')
+
 
     opt = parser.parse_args()
 
@@ -410,16 +471,6 @@ def main():
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
-
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -428,64 +479,57 @@ def main():
 
 
 
-    operation, l_func = get_optimation_details(opt)
+    operation = get_optimation_details(opt)
 
+    image_size = 256
+    transform = transforms.Compose([
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda t: (t * 2) - 1)
+    ])
+    ds = ImageFolder(root='/cmlscratch/hmchu/datasets/celeba_hq_256/', transform=transform)
+    dl = cycle_cat(data.DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=16,
+                                   drop_last=True))
 
-
-    batch_size = 1
-    text = []
-    for i in range(batch_size):
-        if opt.text != None:
-            text.append(opt.text)
-        else:
-            if opt.text_type == 1:
-                text.append("Dog scuba-diving")
-            elif opt.text_type == 2:
-                text.append("a photograph of an astronaut riding a horse")
-            elif opt.text_type == 3:
-                text.append("an oil painting of a corgi wearing a party hat")
-            elif opt.text_type == 4:
-                text.append("a hedgehog using a calculator")
-            elif opt.text_type == 5:
-                text.append("a green train is coming down the tracks")
-            elif opt.text_type == 6:
-                text.append("a photograph of an astronaut riding a horse, artstation")
-
-    text = clip.tokenize(text).cuda()
-
-    precision_scope = autocast if opt.precision=="autocast" else nullcontext
     torch.set_grad_enabled(False)
 
-    with precision_scope("cuda"):
+
         # with model.module.ema_scope():
-        tic = time.time()
-        all_samples = list()
+    tic = time.time()
+    all_samples = list()
 
-        for n in trange(opt.n_iter, desc="Sampling"):
-            for prompts in tqdm(data, desc="data"):
-                uc = None
-                if opt.scale != 1.0:
-                    uc = model.module.get_learned_conditioning(batch_size * [""])
-                if isinstance(prompts, tuple):
-                    prompts = list(prompts)
-                c = model.module.get_learned_conditioning(prompts)
-                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                samples_ddim = sampler.sample(S=opt.ddim_steps,
-                                                 conditioning=c,
-                                                 batch_size=opt.n_samples,
-                                                 shape=shape,
-                                                 verbose=False,
-                                                 unconditional_guidance_scale=opt.scale,
-                                                 unconditional_conditioning=uc,
-                                                 eta=opt.ddim_eta,
-                                                 operated_image=text,
-                                                 operation=operation)
+    for n in trange(opt.n_iter, desc="Sampling"):
 
-                x_samples_ddim = model.module.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+        og_img = next(dl).cuda()
+        temp = (og_img + 1) * 0.5
+        utils.save_image(temp, f'{results_folder}/og_img_{n}.png')
 
-                utils.save_image(x_samples_ddim, f'{results_folder}/og_img_{n}.png')
+        with torch.no_grad():
+            og_img_guide, og_img_mask = operation.operation_func(og_img, return_faces=True, mtcnn_face=True)
+            utils.save_image((og_img_mask + 1) * 0.5, f'{results_folder}/og_img_cut_{n}.png')
 
+        uc = None
+        if opt.scale != 1.0:
+            uc = model.module.get_learned_conditioning(batch_size * [""])
+        c = model.module.get_learned_conditioning(["A headshot of person"])
+
+        for multiple_tries in range(5):
+            shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+            samples_ddim = sampler.sample(S=opt.ddim_steps,
+                                          conditioning=c,
+                                          batch_size=opt.n_samples,
+                                          shape=shape,
+                                          verbose=False,
+                                          unconditional_guidance_scale=opt.scale,
+                                          unconditional_conditioning=uc,
+                                          eta=opt.ddim_eta,
+                                          operated_image=og_img_guide,
+                                          operation=operation)
+
+            x_samples_ddim = model.module.decode_first_stage(samples_ddim)
+            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+            utils.save_image(x_samples_ddim, f'{results_folder}/new_img_{n}_{multiple_tries}.png')
 
 
 
