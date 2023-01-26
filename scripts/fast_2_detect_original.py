@@ -35,7 +35,7 @@ from pathlib import Path
 from PIL import Image
 from torchvision import transforms, utils
 import random
-from helper import OptimizerDetails
+from helper import OptimizerDetails, get_face_text
 import clip
 import os
 import inspect
@@ -442,9 +442,10 @@ def main():
     parser.add_argument('--fr_crop', action='store_true')
     parser.add_argument('--center_face', action='store_true')
 
+    parser.add_argument('--image_index', type=int, default=None)
+
 
     opt = parser.parse_args()
-
     results_folder = opt.optim_folder
     create_folder(results_folder)
 
@@ -499,23 +500,7 @@ def main():
 
     torch.set_grad_enabled(False)
 
-    if opt.text_type == 1:
-        prompt = "Headshot of a person with blonde hair"
-    elif opt.text_type == 2:
-        prompt = "A headshot of person with space background"
-    elif opt.text_type == 3:
-        prompt = "Headshot of a person with blue hair"
-    elif opt.text_type == 4:
-        prompt = "Headshot of a sad person with blonde hair"
-    elif opt.text_type == 5:
-        prompt = "Headshot of a person with blonde hair with space background"
-    elif opt.text_type == 6:
-        prompt = "A happy person smiling and riding a horse"
-    elif opt.text_type == 7:
-        prompt = "A happy person smiling and riding a car"
-    else:
-        prompt = ""
-
+    prompt = get_face_text(opt.text_type)
     print(prompt)
 
 
@@ -525,9 +510,16 @@ def main():
 
     for n in trange(opt.n_iter, desc="Sampling"):
 
-        og_img = next(dl).cuda()
-        temp = (og_img + 1) * 0.5
-        utils.save_image(temp, f'{results_folder}/og_img_{n}.png')
+        if opt.image_index is None:
+            og_img = next(dl).cuda()
+            temp = (og_img + 1) * 0.5
+            utils.save_image(temp, f'{results_folder}/og_img_{n}.png')
+        else:
+            for i in range(opt.image_index + 1):
+                og_img = next(dl).cuda()
+                temp = (og_img + 1) * 0.5
+                utils.save_image(temp, f'{results_folder}/og_img_{n}.png')
+                n+=1
 
         with torch.no_grad():
             og_img_guide, og_img_mask = operation.operation_func(og_img, return_faces=True, mtcnn_face=True)
@@ -537,9 +529,9 @@ def main():
         if opt.scale != 1.0:
             uc = model.module.get_learned_conditioning(batch_size * [""])
         c = model.module.get_learned_conditioning([prompt])
-        for multiple_tries in range(5):
+        for multiple_tries in range(30):
             shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-            samples_ddim = sampler.sample(S=opt.ddim_steps,
+            samples_ddim, start_zt = sampler.sample(S=opt.ddim_steps,
                                              conditioning=c,
                                              batch_size=opt.n_samples,
                                              shape=shape,

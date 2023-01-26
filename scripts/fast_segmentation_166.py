@@ -35,20 +35,35 @@ from pathlib import Path
 from PIL import Image
 from torchvision import transforms, utils
 import random
-from helper import OptimizerDetails, get_face_text
+from helper import OptimizerDetails, get_seg_text
 import clip
 import os
 import inspect
 import torchvision.transforms.functional as TF
-from facenet_pytorch import MTCNN, InceptionResnetV1
+from torchvision.models.segmentation import lraspp_mobilenet_v3_large, LRASPP_MobileNet_V3_Large_Weights
 from torchvision.datasets import ImageFolder
 
+from ldm.data.imagenet_openai import get_loader_from_dataset, get_train_val_datasets
 
 
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+
+
+def get_splitted_dataset(dataset, checkpoint_path='checkpoints/partitions.pt'):
+    obj = torch.load(checkpoint_path)
+
+    partitions_count = obj['partitions_count']
+    partitions = obj['partitions']
+    output = []
+    for partition_ind in range(partitions_count):
+        partition = partitions[partition_ind]
+        subset_dataset = Subset(dataset, partition)
+        output.append(subset_dataset)
+
+    return output
 
 
 def chunk(it, size):
@@ -148,6 +163,13 @@ def return_cv2(img, path):
     img = cv2.copyMakeBorder(img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=black)
     return img
 
+def read_cv2(img, path):
+    black = [255, 255, 255]
+    utils.save_image(img, path, nrow=1)
+    img = cv2.imread(path)
+    img = cv2.copyMakeBorder(img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=black)
+    return img
+
 def cycle(dl):
     while True:
         for data in dl:
@@ -163,120 +185,77 @@ def create_folder(path):
             raise
         pass
 
-
-class FaceRecognition(nn.Module):
-    def __init__(self, fr_crop=False, mtcnn_face=False):
-        super().__init__()
-        self.resnet = InceptionResnetV1(pretrained='vggface2').eval()
-        print(self.resnet)
-        self.mtcnn = MTCNN(device='cuda')
-        self.crop = fr_crop
-        self.output_size = 160
-        self.mtcnn_face = mtcnn_face
-
-    def extract_face(self, imgs, batch_boxes, mtcnn_face=False):
-        image_size = imgs.shape[-1]
-        faces = []
-        for i in range(imgs.shape[0]):
-            img = imgs[i]
-            if not mtcnn_face:
-                box = [48, 48, 208, 208]
-                crop_face = img[None, :, box[1]:box[3], box[0]:box[2]]
-            elif batch_boxes[i] is not None:
-                print("Face Found")
-                box = batch_boxes[i][0]
-                margin = [
-                    self.mtcnn.margin * (box[2] - box[0]) / (self.output_size - self.mtcnn.margin),
-                    self.mtcnn.margin * (box[3] - box[1]) / (self.output_size - self.mtcnn.margin),
-                ]
-
-                box = [
-                    int(max(box[0] - margin[0] / 2, 0)),
-                    int(max(box[1] - margin[1] / 2, 0)),
-                    int(min(box[2] + margin[0] / 2, image_size)),
-                    int(min(box[3] + margin[1] / 2, image_size)),
-                ]
-                crop_face = img[None, :, box[1]:box[3], box[0]:box[2]]
-            else:
-                print("Face Not Found")
-                # crop_face = img[None, :, :, :]
-                return None
-
-            faces.append(F.interpolate(crop_face, size=self.output_size, mode='bicubic'))
-        new_faces = torch.cat(faces)
-
-        return (new_faces - 127.5) / 128.0
-
-    def get_faces(self, x, mtcnn_face=False):
-        img = (x + 1.0) * 0.5 * 255.0
-        img = img.permute(0, 2, 3, 1)
-        with torch.no_grad():
-            batch_boxes, batch_probs, batch_points = self.mtcnn.detect(img, landmarks=True)
-            # Select faces
-            batch_boxes, batch_probs, batch_points = self.mtcnn.select_boxes(
-                batch_boxes, batch_probs, batch_points, img, method=self.mtcnn.selection_method
-            )
-
-        img = img.permute(0, 3, 1, 2)
-        faces = self.extract_face(img, batch_boxes, mtcnn_face)
-        return faces
-
-    def forward(self, x, return_faces=False, mtcnn_face=None):
-        x = TF.resize(x, (256, 256), interpolation=TF.InterpolationMode.BICUBIC)
-
-        if mtcnn_face is None:
-            mtcnn_face = self.mtcnn_face
-
-        faces = self.get_faces(x, mtcnn_face=mtcnn_face)
-        if faces is None:
-            return faces
-
-        if not self.crop:
-            out = self.resnet(x)
-        else:
-            out = self.resnet(faces)
-
-        if return_faces:
-            return out, faces
-        else:
-            return out
-
-    def cuda(self):
-        self.resnet = self.resnet.cuda()
-        self.mtcnn = self.mtcnn.cuda()
-        return self
-
 def cycle_cat(dl):
     while True:
         for data in dl:
             yield data[0]
 
-def l1_loss(input, target):
-    l = torch.abs(input - target).mean(dim=[1])
-    return l
+
+class Segmnetation(nn.Module):
+    def __init__(self, model, Trans):
+        super(Segmnetation, self).__init__()
+        self.model = model#.backbone
+        self.trans = Trans
+
+    def forward(self, x):
+        map = (x + 1) * 0.5
+        map = TF.resize(map, (520, 520), interpolation=TF.InterpolationMode.BILINEAR)
+        map = self.trans(map)
+        map = self.model(map)
+        map = map['out']
+        return map
+
+def mse_loss(input, target):
+    actual_target = target[0]
+    mask = target[1]
+
+    m_sum = mask.sum(dim=[1, 2, 3])
+    m_sum = mask.shape[1] * mask.shape[2] / m_sum
+
+    input = input * mask
+    loss = (input - actual_target) ** 2
+    return loss.mean(dim=[1, 2, 3]) * m_sum
+
+def CrossEntropyLoss(logit, target):
+    target = target[-1]
+    criterion = nn.CrossEntropyLoss(reduce=False, ignore_index=255).cuda()
+    loss = criterion(logit, target.long())
+
+    return loss.mean(dim=[1, 2])
 
 def get_optimation_details(args):
-    mtcnn_face = not args.center_face
-    print('mtcnn_face')
-    print(mtcnn_face)
 
-    guidance_func = FaceRecognition(fr_crop=args.fr_crop, mtcnn_face=mtcnn_face).cuda()
+    weights = LRASPP_MobileNet_V3_Large_Weights.DEFAULT
+    model = lraspp_mobilenet_v3_large( weights=weights)
+    Trans = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    model = model.eval()
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    operation_func = Segmnetation(model, Trans)
+    operation_func = torch.nn.DataParallel(operation_func).cuda()
+    operation_func.eval()
+    for param in operation_func.parameters():
+        param.requires_grad = False
+
     operation = OptimizerDetails()
 
     operation.num_steps = args.optim_num_steps
-    operation.operation_func = guidance_func
+    operation.operation_func = None
+    operation.other_guidance_func = operation_func
 
     operation.optimizer = 'Adam'
     operation.lr = args.optim_lr
-    operation.loss_func = l1_loss
+    operation.loss_func = mse_loss
+    operation.other_criterion = CrossEntropyLoss
 
     operation.max_iters = args.optim_max_iters
     operation.loss_cutoff = args.optim_loss_cutoff
 
     operation.guidance_3 = args.optim_guidance_3
-    operation.guidance_2 = args.optim_guidance_2
-
     operation.optim_guidance_3_wt = args.optim_guidance_3_wt
+    operation.guidance_2 = args.optim_guidance_2
     operation.original_guidance = args.optim_original_guidance
 
     operation.warm_start = args.optim_warm_start
@@ -285,6 +264,64 @@ def get_optimation_details(args):
     operation.folder = args.optim_folder
 
     return operation
+
+def get_pascal_labels():
+    """Load the mapping that associates pascal classes with label colors
+    Returns:
+        np.ndarray with dimensions (21, 3)
+    """
+    return np.asarray([[0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+                       [0, 0, 128], [128, 0, 128], [
+                           0, 128, 128], [128, 128, 128],
+                       [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
+                       [64, 0, 128], [192, 0, 128], [
+                           64, 128, 128], [192, 128, 128],
+                       [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
+                       [0, 64, 128]])
+
+def decode_seg_map_sequence(label_masks):
+    rgb_masks = []
+    for label_mask in label_masks:
+        rgb_mask = decode_segmap(label_mask)
+        rgb_masks.append(rgb_mask)
+    rgb_masks = torch.from_numpy(np.array(rgb_masks).transpose([0, 3, 1, 2]))
+    return rgb_masks
+
+def decode_segmap(label_mask):
+    n_classes = 21
+    label_colours = get_pascal_labels()
+
+    r = label_mask.copy()
+    g = label_mask.copy()
+    b = label_mask.copy()
+
+    for ll in range(0, n_classes):
+        r[label_mask == ll] = label_colours[ll, 0]
+        g[label_mask == ll] = label_colours[ll, 1]
+        b[label_mask == ll] = label_colours[ll, 2]
+
+    rgb = np.zeros((label_mask.shape[0], label_mask.shape[1], 3))
+    rgb[:, :, 0] = r / 255.0
+    rgb[:, :, 1] = g / 255.0
+    rgb[:, :, 2] = b / 255.0
+    return rgb
+
+def get_images(val1, n_samples):
+    take_labels = [166]
+
+    dog_images = []
+    dog_labels = []
+
+    for batch_ind, batch in enumerate(val1):
+        image, label = batch
+        for i in range(label.shape[0]):
+            if label[i] in take_labels:
+                dog_images.append(image[i:i+1])
+                dog_labels.append(label[i:i+1])
+
+                if len(dog_images) == n_samples:
+                    return dog_images, dog_labels
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -437,12 +474,10 @@ def main():
     parser.add_argument("--optim_mask_fraction", default=0.5, type=float)
     parser.add_argument("--text", default=None)
     parser.add_argument('--text_type', type=int, default=1)
-    parser.add_argument("--batches", default=0, type=int)
+    parser.add_argument("--batch_size", default=0, type=int)
 
-    parser.add_argument('--fr_crop', action='store_true')
-    parser.add_argument('--center_face', action='store_true')
+    parser.add_argument("--to_take", nargs="+", default=[1], type=int)
 
-    parser.add_argument('--image_mean', type=int, default=1)
 
 
     opt = parser.parse_args()
@@ -488,72 +523,122 @@ def main():
 
 
     operation = get_optimation_details(opt)
-    image_size = 256
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda t: (t * 2) - 1)
-    ])
-
-    ds = ImageFolder(root='/cmlscratch/bansal01/fall_2022/stable-diffusion-2/self_made_celebs/', transform=transform)
-    # root = '/cmlscratch/bansal01/fall_2022/stable-diffusion-2/self_made_celebs/ariana/'
-    # ds = Dataset(root, opt.W)
-
-    print(len(ds))
-    dl = cycle_cat(data.DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=16,
-                                   drop_last=True))
-
     torch.set_grad_enabled(False)
 
-    prompt = get_face_text(opt.text_type)
+    prompt = get_seg_text(opt.text_type)
     print(prompt)
 
+    print('loading the dataset...')
+    train_dataset, val_dataset = get_train_val_datasets(batch_size)
+    print('done')
+    print('splitting the dataset...')
+    base = '/cmlscratch/bansal01/fall_2022/Guided_Diffusion_Imagenet/'
+    train1, train2 = get_splitted_dataset(dataset=train_dataset,
+                                          checkpoint_path=base + 'checkpoints/non_equal_split/partitions_train.pt')
+    val1, val2 = get_splitted_dataset(dataset=val_dataset,
+                                      checkpoint_path=base + 'checkpoints/non_equal_split/partitions_val.pt')
+    print('done')
+    train1, train2 = get_loader_from_dataset(batch_size, train1, True), get_loader_from_dataset(batch_size, train2, False)
+    val1, val2 = get_loader_from_dataset(batch_size, val1, True), get_loader_from_dataset(batch_size, val2, False)
 
-        # with model.module.ema_scope():
-    tic = time.time()
-    all_samples = list()
+    dog_images, dog_labels = get_images(val1, opt.n_iter * batch_size)
+    dog_images = torch.concat(dog_images, dim=0)
+    dog_labels = torch.concat(dog_labels, dim=0)
+
+    with open(base + 'imagenet1000_clsidx_to_labels.txt', 'r') as inf:
+        dict_from_file = eval(inf.read())
+
+    to_take = opt.to_take #[11, 15, 18]
 
     for n in trange(opt.n_iter, desc="Sampling"):
 
-        mean_og_img_guide = None
-        for k in range(opt.image_mean):
-            og_img = next(dl).cuda()
-            temp = (og_img + 1) * 0.5
-            utils.save_image(temp, f'{results_folder}/og_img_{n}_{k}.png')
+        if n in to_take:
+            start = n * batch_size
+            end = n * batch_size + batch_size
+
+            print(start, end)
+
+            image, label = dog_images[start: end], dog_labels[start: end]
+            image, label = image.cuda(), label.cuda()
+            print(label)
+
+            p1 = dict_from_file[label.cpu().numpy()[0]]
+            final_prompt = p1 + prompt
+            print(p1)
 
             with torch.no_grad():
-                og_img_guide, og_img_mask = operation.operation_func(og_img, return_faces=True, mtcnn_face=True)
-                utils.save_image((og_img_mask + 1) * 0.5, f'{results_folder}/og_img_cut_{n}_{k}.png')
-                if mean_og_img_guide is None:
-                    mean_og_img_guide = og_img_guide
-                else:
-                    mean_og_img_guide += og_img_guide
+                map = operation.other_guidance_func(image).softmax(dim=1)
 
-        mean_og_img_guide /= opt.image_mean
-        print(mean_og_img_guide.shape)
-        # exit()
+                target_np = map.data.cpu().numpy()
+                target_np = np.argmax(target_np, axis=1)
 
-        uc = None
-        if opt.scale != 1.0:
-            uc = model.module.get_learned_conditioning(batch_size * [""])
-        c = model.module.get_learned_conditioning([prompt])
-        for multiple_tries in range(30):
-            shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-            samples_ddim, start_zt = sampler.sample(S=opt.ddim_steps,
-                                             conditioning=c,
-                                             batch_size=opt.n_samples,
-                                             shape=shape,
-                                             verbose=False,
-                                             unconditional_guidance_scale=opt.scale,
-                                             unconditional_conditioning=uc,
-                                             eta=opt.ddim_eta,
-                                             operated_image=mean_og_img_guide,
-                                             operation=operation)
+                old_map = torch.clone(map)
+                num_class = map.shape[1]
+                print(map.shape)
+                #
+                max_vals, max_indices = torch.max(map, 1)
+                print(max_indices.shape)
+                map = max_indices
 
-            x_samples_ddim = model.module.decode_first_stage(samples_ddim)
-            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                sep_map = F.one_hot(map, num_classes=num_class)
+                sep_map = sep_map.permute(0, 3, 1, 2).float()
+                print(sep_map.shape)
 
-            utils.save_image(x_samples_ddim, f'{results_folder}/new_img_{n}_{multiple_tries}.png')
-            torch.save(start_zt, f'{results_folder}/start_zt_{n}_{multiple_tries}.pt')
+            label_save = decode_seg_map_sequence(torch.squeeze(map, 1).detach(
+            ).cpu().numpy())
+
+            utils.save_image(label_save, f'{results_folder}/label_{n}.png')
+            utils.save_image((image + 1) * 0.5, f'{results_folder}/og_img_{n}.png')
+
+            mask = sep_map[:, 0:1, :, :]
+            mask = TF.resize(mask, (256, 256), interpolation=TF.InterpolationMode.BILINEAR)
+            image_mask = image * mask
+
+            utils.save_image(mask, f'{results_folder}/mask_{n}.png')
+            utils.save_image((image_mask + 1) * 0.5, f'{results_folder}/image_mask_{n}.png')
+
+            uc = None
+            if opt.scale != 1.0:
+                uc = model.module.get_learned_conditioning(batch_size * [""])
+            c = model.module.get_learned_conditioning([final_prompt])
+
+            for multiple_tries in range(10):
+                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                samples_ddim, start_zt = sampler.sample(S=opt.ddim_steps,
+                                                 conditioning=c,
+                                                 batch_size=opt.n_samples,
+                                                 shape=shape,
+                                                 verbose=False,
+                                                 unconditional_guidance_scale=opt.scale,
+                                                 unconditional_conditioning=uc,
+                                                 eta=opt.ddim_eta,
+                                                 operated_image=[image_mask, mask, map],
+                                                 operation=operation)
+
+                x_samples_ddim = model.module.decode_first_stage(samples_ddim)
+                x_samples_ddim_unnorm = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                utils.save_image(x_samples_ddim_unnorm, f'{results_folder}/new_img_{n}_{multiple_tries}.png')
+
+                with torch.no_grad():
+                    new_map = operation.other_guidance_func(x_samples_ddim)
+
+                    pred = new_map.data.cpu().numpy()
+                    pred = np.argmax(pred, axis=1)
+
+                    new_image_map = new_map.softmax(dim=1)
+                    num_class = new_map.shape[1]
+
+                    max_vals, max_indices = torch.max(new_image_map, 1)
+                    new_image_map = max_indices
+
+                new_image_map_save = decode_seg_map_sequence(torch.squeeze(new_image_map, 1).detach(
+                ).cpu().numpy())
+
+                utils.save_image(new_image_map_save, f'{results_folder}/new_image_map_save_{n}_{multiple_tries}.png')
+
+                print(target_np.shape, pred.shape)
+                torch.save(start_zt, f'{results_folder}/start_zt_{n}_{multiple_tries}.pt')
 
 
 

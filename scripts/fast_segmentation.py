@@ -35,7 +35,7 @@ from pathlib import Path
 from PIL import Image
 from torchvision import transforms, utils
 import random
-from helper import OptimizerDetails
+from helper import OptimizerDetails, get_seg_text
 import clip
 import os
 import inspect
@@ -523,13 +523,7 @@ def main():
     operation = get_optimation_details(opt)
     torch.set_grad_enabled(False)
 
-    if opt.text_type == 1:
-        prompt = ""
-    elif opt.text_type == 2:
-        prompt = " in space"
-    else:
-        prompt = ""
-
+    prompt = get_seg_text(opt.text_type)
     print(prompt)
 
     print('loading the dataset...')
@@ -554,91 +548,93 @@ def main():
 
     for n in trange(opt.n_iter, desc="Sampling"):
 
-        start = n * batch_size
-        end = n * batch_size + batch_size
+        if n==5:
+            start = n * batch_size
+            end = n * batch_size + batch_size
 
-        print(start, end)
+            print(start, end)
 
-        image, label = dog_images[start: end], dog_labels[start: end]
-        image, label = image.cuda(), label.cuda()
-        print(label)
+            image, label = dog_images[start: end], dog_labels[start: end]
+            image, label = image.cuda(), label.cuda()
+            print(label)
 
-        p1 = dict_from_file[label.cpu().numpy()[0]]
-        final_prompt = p1 + prompt
-        print(p1)
-
-        with torch.no_grad():
-            map = operation.other_guidance_func(image).softmax(dim=1)
-
-            target_np = map.data.cpu().numpy()
-            target_np = np.argmax(target_np, axis=1)
-
-            old_map = torch.clone(map)
-            num_class = map.shape[1]
-            print(map.shape)
-            #
-            max_vals, max_indices = torch.max(map, 1)
-            print(max_indices.shape)
-            map = max_indices
-
-            sep_map = F.one_hot(map, num_classes=num_class)
-            sep_map = sep_map.permute(0, 3, 1, 2).float()
-            print(sep_map.shape)
-
-        label_save = decode_seg_map_sequence(torch.squeeze(map, 1).detach(
-        ).cpu().numpy())
-
-        utils.save_image(label_save, f'{results_folder}/label_{n}.png')
-        utils.save_image((image + 1) * 0.5, f'{results_folder}/og_img_{n}.png')
-
-        mask = sep_map[:, 0:1, :, :]
-        mask = TF.resize(mask, (256, 256), interpolation=TF.InterpolationMode.BILINEAR)
-        image_mask = image * mask
-
-        utils.save_image(mask, f'{results_folder}/mask_{n}.png')
-        utils.save_image((image_mask + 1) * 0.5, f'{results_folder}/image_mask_{n}.png')
-
-        uc = None
-        if opt.scale != 1.0:
-            uc = model.module.get_learned_conditioning(batch_size * [""])
-        c = model.module.get_learned_conditioning([final_prompt])
-
-        for multiple_tries in range(2):
-            shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-            samples_ddim = sampler.sample(S=opt.ddim_steps,
-                                             conditioning=c,
-                                             batch_size=opt.n_samples,
-                                             shape=shape,
-                                             verbose=False,
-                                             unconditional_guidance_scale=opt.scale,
-                                             unconditional_conditioning=uc,
-                                             eta=opt.ddim_eta,
-                                             operated_image=[image_mask, mask, map],
-                                             operation=operation)
-
-            x_samples_ddim = model.module.decode_first_stage(samples_ddim)
-            x_samples_ddim_unnorm = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-
-            utils.save_image(x_samples_ddim_unnorm, f'{results_folder}/new_img_{n}_{multiple_tries}.png')
+            p1 = dict_from_file[label.cpu().numpy()[0]]
+            final_prompt = p1 + prompt
+            print(p1)
 
             with torch.no_grad():
-                new_map = operation.other_guidance_func(x_samples_ddim)
+                map = operation.other_guidance_func(image).softmax(dim=1)
 
-                pred = new_map.data.cpu().numpy()
-                pred = np.argmax(pred, axis=1)
+                target_np = map.data.cpu().numpy()
+                target_np = np.argmax(target_np, axis=1)
 
-                new_image_map = new_map.softmax(dim=1)
-                num_class = new_map.shape[1]
+                old_map = torch.clone(map)
+                num_class = map.shape[1]
+                print(map.shape)
+                #
+                max_vals, max_indices = torch.max(map, 1)
+                print(max_indices.shape)
+                map = max_indices
 
-                max_vals, max_indices = torch.max(new_image_map, 1)
-                new_image_map = max_indices
+                sep_map = F.one_hot(map, num_classes=num_class)
+                sep_map = sep_map.permute(0, 3, 1, 2).float()
+                print(sep_map.shape)
 
-            new_image_map_save = decode_seg_map_sequence(torch.squeeze(new_image_map, 1).detach(
+            label_save = decode_seg_map_sequence(torch.squeeze(map, 1).detach(
             ).cpu().numpy())
 
-            utils.save_image(new_image_map_save, f'{results_folder}/new_image_map_save_{n}_{multiple_tries}.png')
+            utils.save_image(label_save, f'{results_folder}/label_{n}.png')
+            utils.save_image((image + 1) * 0.5, f'{results_folder}/og_img_{n}.png')
 
-            print(target_np.shape, pred.shape)
+            mask = sep_map[:, 0:1, :, :]
+            mask = TF.resize(mask, (256, 256), interpolation=TF.InterpolationMode.BILINEAR)
+            image_mask = image * mask
+
+            utils.save_image(mask, f'{results_folder}/mask_{n}.png')
+            utils.save_image((image_mask + 1) * 0.5, f'{results_folder}/image_mask_{n}.png')
+
+            uc = None
+            if opt.scale != 1.0:
+                uc = model.module.get_learned_conditioning(batch_size * [""])
+            c = model.module.get_learned_conditioning([final_prompt])
+
+            for multiple_tries in range(2):
+                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                samples_ddim, start_zt = sampler.sample(S=opt.ddim_steps,
+                                                 conditioning=c,
+                                                 batch_size=opt.n_samples,
+                                                 shape=shape,
+                                                 verbose=False,
+                                                 unconditional_guidance_scale=opt.scale,
+                                                 unconditional_conditioning=uc,
+                                                 eta=opt.ddim_eta,
+                                                 operated_image=[image_mask, mask, map],
+                                                 operation=operation)
+
+                x_samples_ddim = model.module.decode_first_stage(samples_ddim)
+                x_samples_ddim_unnorm = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                utils.save_image(x_samples_ddim_unnorm, f'{results_folder}/new_img_{n}_{multiple_tries}.png')
+
+                with torch.no_grad():
+                    new_map = operation.other_guidance_func(x_samples_ddim)
+
+                    pred = new_map.data.cpu().numpy()
+                    pred = np.argmax(pred, axis=1)
+
+                    new_image_map = new_map.softmax(dim=1)
+                    num_class = new_map.shape[1]
+
+                    max_vals, max_indices = torch.max(new_image_map, 1)
+                    new_image_map = max_indices
+
+                new_image_map_save = decode_seg_map_sequence(torch.squeeze(new_image_map, 1).detach(
+                ).cpu().numpy())
+
+                utils.save_image(new_image_map_save, f'{results_folder}/new_image_map_save_{n}_{multiple_tries}.png')
+
+                print(target_np.shape, pred.shape)
+                torch.save(start_zt, f'{results_folder}/start_zt_{n}_{multiple_tries}.pt')
 
 
 

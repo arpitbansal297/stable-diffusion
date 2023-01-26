@@ -68,6 +68,7 @@ class DDIMSamplerWithGrad(object):
                verbose=True,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               start_zt=None
                ):
 
 
@@ -81,7 +82,11 @@ class DDIMSamplerWithGrad(object):
         device = self.model.module.betas.device
         b = shape[0]
 
-        img = torch.randn(shape, device=device)
+        if start_zt is None:
+            img = torch.randn(shape, device=device)
+            start_zt = img
+        else:
+            img = start_zt
 
         timesteps = self.ddim_timesteps
         time_range = np.flip(timesteps)
@@ -223,7 +228,7 @@ class DDIMSamplerWithGrad(object):
             img = x_prev
 
 
-        return img
+        return img, start_zt
 
 
     def sample_seperate(self,
